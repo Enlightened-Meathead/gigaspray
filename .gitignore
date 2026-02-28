@@ -1,0 +1,19 @@
+# Gigaspray workspace directories (created at runtime, contain sensitive data)
+gigaspray/
+*/gigaspray/
+
+# Workspace files if ever created in repo root
+all_user.txt
+all_pass.txt
+user_paired.txt
+pass_paired.txt
+all_hashes.txt
+hash_user_paired.txt
+hashes_paired.txt
+creds.txt
+valid_creds.txt
+hosts.txt
+hosts_ip.txt
+hosts_dn.txt
+hosts_fqdn.txt
+logs/
