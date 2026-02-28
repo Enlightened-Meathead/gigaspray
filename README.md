@@ -16,7 +16,7 @@ You may say, "Well, what about":
 Gigaspray solves this. Gigaspray wraps [NetExec (nxc)](https://github.com/Pennyw0rth/NetExec) to give you a persistent workspace that accumulates credentials and hosts as you enumerate, then sprays them across protocols on demand. Valid hits are automatically recorded, and all command ran and output is automatically logged. You can also log specific commands to an individual log file for that command in addition to it being appended to the project log file. 
 
 > [!NOTE]
-> This is the first iteration of this tool and its very basic spraying functionality for targeted or mass spraying with passwords or hashes across a single or all protocols has little to zero OPSEC. This tool is fantastic for management of nodes in the AD environments and file organizaiton, but be aware the spraying options are mainly for CTF/OSCP environments or where you don't have to worry about user lockouts. This isn't a tool for sneaky spraying, its a firehose. Right now if you want more fine tuned sprays, just use regular Netexec, but this is something I'll probably add in the future :)
+> This is the first iteration of this tool and its very basic spraying functionality for targeted or mass spraying with passwords or hashes across a single or all protocols has little to zero OPSEC. This tool is fantastic for management of nodes in the AD environments and file organizaiton, but be aware the spraying options are mainly for CTF/OSCP environments or where you don't have to worry about user lockouts. This isn't a tool for sneaky spraying, its a firehose. Right now if you want more fine tuned sprays, just use regular Netexec :)
 ---
 
 ## Requirements
