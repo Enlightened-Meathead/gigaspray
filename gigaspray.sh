@@ -26,6 +26,7 @@ VERBOSE=0                # -v: show per-item detail during bulk imports
 SPRAY_LOCAL_AUTH=0       # 1=also spray with --local-auth; loaded from config, CLI overrides
 _WRITE_CRED_ADDED=0      # internal: set to 1 by write_cred() when anything new is added
 _CLEAN_REMOVED=0         # internal: duplicate count accumulated by cmd_clean helpers
+_NXC_HIT_COUNT=0         # internal: credential hits found in the last spray_exec run
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 info()    { echo -e "${CYAN}[*]${RESET} $*"; }
@@ -859,6 +860,7 @@ record_valid_cred() {
 #   PROTO  IP  PORT  HOSTNAME  [+] [DOMAIN\]user:cred [(Pwn3d!)]
 parse_nxc_hits() {
     local protocol="$1" tmpfile="$2"
+    _NXC_HIT_COUNT=0
     [[ ! -f "$tmpfile" ]] && return
     while IFS= read -r line; do
         [[ "$line" != *'[+]'* ]] && continue
@@ -875,16 +877,21 @@ parse_nxc_hits() {
         [[ "$user_and_cred" != *:* ]] && continue
         local u="${user_and_cred%%:*}"
         local c="${user_and_cred#*:}"
-        [[ -n "$u" && -n "$c" ]] && record_valid_cred "$u" "$c" "$protocol" "$host"
+        if [[ -n "$u" && -n "$c" ]]; then
+            _NXC_HIT_COUNT=$(( _NXC_HIT_COUNT + 1 ))
+            record_valid_cred "$u" "$c" "$protocol" "$host"
+        fi
     done < "$tmpfile"
 }
 
-# ─── Execute one nxc spray command, handling -q and -o output routing ─────────
-# Always prints the command first. Then:
-#   -q         : terminal shows only [+] hits (successes); files still get full output
-#   -o <name>  : full output appended to logs/<name> AND logs/gigaspray.log
-#   both       : filtered terminal, full files
-#   neither    : full output to terminal only (summary log_entry still written)
+# ─── Execute one nxc spray command, handling -v/-q/-o output routing ──────────
+# Terminal output modes (priority: -q > -v > default):
+#   default    : [*] info and [+] success lines only; [-] failures suppressed
+#   -v         : all nxc output including [-] failures
+#   -q         : [+] success lines only
+# Log files (-o <name>): always receive full output regardless of terminal mode.
+# After each command in default mode, prints "[>] No valid credentials found..."
+# when no credential hits were detected in that run.
 spray_exec() {
     local label="$1"; shift   # e.g. "SMB pass-spray"
     local protocol="$1"; shift # protocol name for hit recording (smb, ssh, etc.)
@@ -921,27 +928,44 @@ spray_exec() {
             "$timestamp" "$label" "${cmd[*]}" | tee -a "$outfile" >> "$log_main"
     fi
 
-    # Run and route output; tee to tmpfile first so we can parse hits after
-    if [[ -n "$outfile" && "$SPRAY_QUIET" -eq 1 ]]; then
-        # Full output → outfile + main log; filtered output → terminal
-        "${cmd[@]}" 2>&1 | tee "$tmpfile" | tee -a "$outfile" | tee -a "$log_main" \
-            | grep -aF '[+]' || true
-
-    elif [[ -n "$outfile" ]]; then
-        # Full output → outfile + main log + terminal
-        "${cmd[@]}" 2>&1 | tee "$tmpfile" | tee -a "$outfile" | tee -a "$log_main" || true
-
-    elif [[ "$SPRAY_QUIET" -eq 1 ]]; then
-        # Filtered output → terminal only
-        "${cmd[@]}" 2>&1 | tee "$tmpfile" | grep -aF '[+]' || true
-
+    # ── Run and route output ───────────────────────────────────────────────────
+    # Full output always goes to tmpfile (for hit parsing) and to any named
+    # outfile/log.  What reaches the terminal depends on the mode flags.
+    if [[ -n "$outfile" ]]; then
+        if [[ "$SPRAY_QUIET" -eq 1 ]]; then
+            # Full → outfile + log; [+] only → terminal
+            "${cmd[@]}" 2>&1 | tee "$tmpfile" | tee -a "$outfile" | tee -a "$log_main" \
+                | grep --line-buffered -aF '[+]' || true
+        elif [[ "$VERBOSE" -eq 1 ]]; then
+            # Full → outfile + log + terminal
+            "${cmd[@]}" 2>&1 | tee "$tmpfile" | tee -a "$outfile" | tee -a "$log_main" || true
+        else
+            # Default: Full → outfile + log; [*] and [+] → terminal
+            "${cmd[@]}" 2>&1 | tee "$tmpfile" | tee -a "$outfile" | tee -a "$log_main" \
+                | grep --line-buffered -aE '\[\*\]|\[\+\]' || true
+        fi
     else
-        # Full output → terminal only
-        "${cmd[@]}" 2>&1 | tee "$tmpfile" || true
+        if [[ "$SPRAY_QUIET" -eq 1 ]]; then
+            # [+] only → terminal; full → tmpfile
+            "${cmd[@]}" 2>&1 | tee "$tmpfile" | grep --line-buffered -aF '[+]' || true
+        elif [[ "$VERBOSE" -eq 1 ]]; then
+            # Full → terminal + tmpfile
+            "${cmd[@]}" 2>&1 | tee "$tmpfile" || true
+        else
+            # Default: [*] and [+] → terminal; full → tmpfile
+            "${cmd[@]}" 2>&1 | tee "$tmpfile" \
+                | grep --line-buffered -aE '\[\*\]|\[\+\]' || true
+        fi
     fi
 
     # Parse [+] hits and append unique entries to valid_creds.txt
     parse_nxc_hits "$protocol" "$tmpfile"
+
+    # In default mode, report when no credential hits were found in this run
+    if [[ "$SPRAY_QUIET" -eq 0 && "$VERBOSE" -eq 0 && "$_NXC_HIT_COUNT" -eq 0 ]]; then
+        echo -e "  ${CYAN}[>]${RESET} No valid credentials found for this command. Moving on..."
+    fi
+
     rm -f "$tmpfile"
 }
 
