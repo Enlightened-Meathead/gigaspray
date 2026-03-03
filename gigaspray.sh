@@ -27,6 +27,7 @@ SPRAY_LOCAL_AUTH=0       # 1=also spray with --local-auth; loaded from config, C
 _WRITE_CRED_ADDED=0      # internal: set to 1 by write_cred() when anything new is added
 _CLEAN_REMOVED=0         # internal: duplicate count accumulated by cmd_clean helpers
 _NXC_HIT_COUNT=0         # internal: credential hits found in the last spray_exec run
+SPRAY_PROXYCHAINS=0      # --proxychains: prepend proxychains to every nxc spray command
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 info()    { echo -e "${CYAN}[*]${RESET} $*"; }
@@ -109,6 +110,8 @@ usage() {
     echo "                         Config: ~/.config/gigaspray/gigaspray.conf"
     echo "                           local-auth=True   (default)"
     echo "                           local-auth=False"
+    echo "  --proxychains          Prepend proxychains to every nxc spray command."
+    echo "                         Use when spraying through a pivot/SOCKS proxy."
     echo
     echo -e "${BOLD}Spray output options${RESET} (apply to all spray commands):"
     echo "  -q                     Quiet — show only [+] hits on terminal."
@@ -896,6 +899,7 @@ spray_exec() {
     local label="$1"; shift   # e.g. "SMB pass-spray"
     local protocol="$1"; shift # protocol name for hit recording (smb, ssh, etc.)
     local -a cmd=("$@")
+    [[ "$SPRAY_PROXYCHAINS" -eq 1 ]] && cmd=(proxychains "${cmd[@]}")
     local log_main="${GS_DIR}/logs/gigaspray.log"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -1147,6 +1151,7 @@ cmd_add() {
                              DNS_SERVER="$2"; shift 2 ;;
             --local-auth)    SPRAY_LOCAL_AUTH=1; shift ;;
             --no-local-auth) SPRAY_LOCAL_AUTH=0; shift ;;
+            --proxychains)   SPRAY_PROXYCHAINS=1; shift ;;
             -v)              VERBOSE=1; shift ;;
             *)         die "Unknown option for --add: $1" ;;
         esac
@@ -1532,6 +1537,8 @@ main() {
                 SPRAY_LOCAL_AUTH=1; shift ;;
             --no-local-auth)
                 SPRAY_LOCAL_AUTH=0; shift ;;
+            --proxychains)
+                SPRAY_PROXYCHAINS=1; shift ;;
             -o)
                 [[ $# -lt 2 ]] && die "-o requires a name argument"
                 SPRAY_OUTNAME="$2"; shift 2 ;;
@@ -1578,6 +1585,7 @@ main() {
                                          SPRAY_EPHEMERAL_HASH="$2"; shift 2 ;;
                         --local-auth)    SPRAY_LOCAL_AUTH=1; shift ;;
                         --no-local-auth) SPRAY_LOCAL_AUTH=0; shift ;;
+                        --proxychains)   SPRAY_PROXYCHAINS=1; shift ;;
                         *)               break ;;
                     esac
                 done
