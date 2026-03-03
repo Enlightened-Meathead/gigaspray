@@ -151,6 +151,11 @@ usage() {
     echo "  -P <file>              Import passwords from file (one per line)"
     echo "  -L <file>              Import user:pass pairs from file (one per line)"
     echo "                         Passwords containing colons are handled correctly."
+    echo "  --secretsdump <file>   Import from secretsdump output."
+    echo "                         Parses username and NT hash from each line:"
+    echo "                           username:RID:LM_hash:NT_hash:::"
+    echo "                         DOMAIN\\ prefix is stripped from usernames."
+    echo "                         Machine accounts (ending in \$) are included."
     echo
     echo -e "${BOLD}--add host options:${RESET}"
     echo "  -h <value>             Add a host by IP, domain name, FQDN, or file."
@@ -200,6 +205,8 @@ usage() {
     echo    "  $TOOL_NAME --add 'john:P@\$\$w0rd'                  # inline user:pass"
     echo    "  $TOOL_NAME --add -U users.txt -P passes.txt         # paired file import"
     echo    "  $TOOL_NAME --add -L creds.txt                       # user:pass file import"
+    echo    "  $TOOL_NAME --add --secretsdump hashes.txt           # secretsdump NT hashes"
+    echo    "  $TOOL_NAME --add --secretsdump hashes.txt --spray-smb  # import then spray"
     echo
     echo    "  # Add a host"
     echo    "  $TOOL_NAME --add -h 10.10.10.5       # IP — nxc probes for hostname/domain"
@@ -780,6 +787,52 @@ write_cred() {
     fi
 }
 
+# ─── Import secretsdump output (username:RID:LM:NT:::) ───────────────────────
+# Format: Administrator:500:aad3b435b51404eeaad3b435b51404ee:<NT_hash>:::
+# Extracts username and NT hash per line; strips DOMAIN\ prefix if present.
+import_secretsdump() {
+    local file="$1"
+    local desc="${2:-}"
+    local added=0 skipped=0
+
+    info "Importing secretsdump: ${BOLD}${file}${RESET}"
+    [[ "$VERBOSE" -eq 1 ]] && echo
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+
+        # Need at least 4 colon-separated fields
+        [[ "$line" != *:*:*:* ]] && continue
+
+        local raw_user nt_hash
+        raw_user="$(echo "$line" | cut -d: -f1)"
+        nt_hash="$(echo "$line"  | cut -d: -f4)"
+
+        # Strip DOMAIN\ prefix from username
+        local user="${raw_user##*\\}"
+
+        [[ -z "$user" || -z "$nt_hash" ]] && continue
+
+        # Validate: NT hash must be exactly 32 hex chars
+        [[ ! "$nt_hash" =~ ^[0-9a-fA-F]{32}$ ]] && continue
+
+        _WRITE_CRED_ADDED=0
+        write_cred "$user" "" "$nt_hash" "$desc"
+        if [[ "$_WRITE_CRED_ADDED" -eq 1 ]]; then
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${GREEN}+${RESET} ${user}  :  ${nt_hash}"
+            added=$((added + 1))
+        else
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${YELLOW}~${RESET} ${user}  already imported — skipped"
+            skipped=$((skipped + 1))
+        fi
+    done < "$file"
+
+    echo
+    success "Imported $((added + skipped)) credential(s) from $(basename "$file"): ${added} new, ${skipped} skipped."
+}
+
 # ─── Record one valid credential hit to valid_creds.txt ───────────────────────
 record_valid_cred() {
     local user="$1" cred="$2" protocol="$3" host="$4"
@@ -1013,7 +1066,7 @@ cmd_add() {
     local flag_dir="$1"; shift
 
     local username="" password="" hash="" desc=""
-    local user_file="" pass_file="" cred_file=""
+    local user_file="" pass_file="" cred_file="" secretsdump_file=""
     local host_val=""
     local -a spray_protocols=()
 
@@ -1039,8 +1092,10 @@ cmd_add() {
                        user_file="$2"; shift 2 ;;
             -P)        [[ $# -lt 2 ]] && die "-P requires a file path"
                        pass_file="$2"; shift 2 ;;
-            -L)        [[ $# -lt 2 ]] && die "-L requires a file path"
-                       cred_file="$2"; shift 2 ;;
+            -L)            [[ $# -lt 2 ]] && die "-L requires a file path"
+                           cred_file="$2"; shift 2 ;;
+            --secretsdump) [[ $# -lt 2 ]] && die "--secretsdump requires a file path"
+                           secretsdump_file="$2"; shift 2 ;;
             -h)        [[ $# -lt 2 ]] && die "-h requires a host value (IP, domain, or FQDN)"
                        host_val="$2"; shift 2 ;;
             --spray-smb)   spray_protocols+=(smb);   shift ;;
@@ -1093,7 +1148,8 @@ cmd_add() {
     # ── Nothing provided at all ────────────────────────────────────────────────
     if [[ -z "$username" && -z "$password" && -z "$hash" \
        && -z "$host_val" \
-       && -z "$user_file" && -z "$pass_file" && -z "$cred_file" ]]; then
+       && -z "$user_file" && -z "$pass_file" && -z "$cred_file" \
+       && -z "$secretsdump_file" ]]; then
         error "Nothing to add. Provide credentials or a file to import."
         echo
         usage
@@ -1136,6 +1192,13 @@ cmd_add() {
         done < "$cred_file"
         echo
         success "Imported $((added + skipped)) credential pair(s) from $(basename "$cred_file"): ${added} new, ${skipped} skipped."
+    fi
+
+    # ── --secretsdump: import username:NT pairs from secretsdump output ──────────
+    if [[ -n "$secretsdump_file" ]]; then
+        [[ ! -f "$secretsdump_file" ]] && die "secretsdump file not found: $secretsdump_file"
+        echo
+        import_secretsdump "$secretsdump_file" "$desc"
     fi
 
     # ── -U / -P: import from separate user and/or password files ──────────────
