@@ -1078,6 +1078,11 @@ run_sprays() {
         die "nxc not found — cannot spray"
     fi
 
+    # Snapshot valid_creds.txt so we can diff new hits at the end
+    local vc_file="${GS_DIR}/valid_creds.txt"
+    local vc_before=0
+    [[ -f "$vc_file" ]] && vc_before="$(wc -l < "$vc_file")"
+
     echo
     info "Starting spray (${#protocols[@]} protocol(s): ${protocols[*]})"
     local target_display="${SPRAY_HOSTS:-${GS_DIR}/hosts_ip.txt}"
@@ -1095,6 +1100,28 @@ run_sprays() {
 
     echo
     success "Spray complete."
+
+    # ── End-of-run summary ─────────────────────────────────────────────────────
+    local vc_after=0
+    [[ -f "$vc_file" ]] && vc_after="$(wc -l < "$vc_file")"
+    local new_hits=$(( vc_after - vc_before ))
+
+    if [[ "$new_hits" -gt 0 ]]; then
+        echo
+        echo -e "${GREEN}${BOLD}  [+] ${new_hits} valid credential(s) found this run:${RESET}"
+        echo "  ──────────────────────────────────────────────────────────────"
+        tail -n "$new_hits" "$vc_file" | while IFS= read -r entry; do
+            # Parse from the right to handle passwords that contain colons:
+            #   format: user:cred:protocol:host
+            local host="${entry##*:}"
+            local rest="${entry%:*}"
+            local proto="${rest##*:}"
+            local user_cred="${rest%:*}"
+            echo -e "  ${GREEN}✓${RESET}  ${BOLD}${user_cred}${RESET}  →  ${proto^^}  @  ${host}"
+        done
+        echo "  ──────────────────────────────────────────────────────────────"
+        echo
+    fi
 }
 
 # ─── --add command ────────────────────────────────────────────────────────────
