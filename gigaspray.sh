@@ -17,7 +17,14 @@ GS_DIR=""   # resolved at runtime via require_gs_dir() or resolve_gs_dir()
 SPRAY_PROTOCOLS=(smb rdp winrm ssh ldap ftp mssql)
 SPRAY_QUIET=0      # -q: filter terminal output to [+] hits only
 SPRAY_OUTNAME=""   # -o <name>: save full output to logs/<name>
-SPRAY_HOSTS=""     # --spray-hosts: override default hosts_ip.txt target
+SPRAY_HOSTS=""     # --spray-hosts / -h: override default hosts_ip.txt target
+SPRAY_EPHEMERAL_USER=""  # -u (standalone): ephemeral user, not saved to files
+SPRAY_EPHEMERAL_PASS=""  # -p (standalone): ephemeral pass, not saved to files
+SPRAY_EPHEMERAL_HASH=""  # -H (standalone): ephemeral hash, not saved to files
+DNS_SERVER=""            # --dns-server: override DNS server for bulk host resolution
+VERBOSE=0                # -v: show per-item detail during bulk imports
+SPRAY_LOCAL_AUTH=0       # 1=also spray with --local-auth; loaded from config, CLI overrides
+_WRITE_CRED_ADDED=0      # internal: set to 1 by write_cred() when anything new is added
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 info()    { echo -e "${CYAN}[*]${RESET} $*"; }
@@ -49,6 +56,41 @@ EOF
     echo
 }
 
+# ─── Load (and auto-create) ~/.config/gigaspray/gigaspray.conf ───────────────
+load_config() {
+    local conf_dir="${HOME}/.config/gigaspray"
+    local conf="${conf_dir}/gigaspray.conf"
+
+    # Create default config on first run
+    if [[ ! -f "$conf" ]]; then
+        mkdir -p "$conf_dir"
+        cat > "$conf" << 'EOF'
+# gigaspray configuration
+# local-auth: also spray with --local-auth (test local accounts in addition to domain)
+local-auth=True
+EOF
+    fi
+
+    # Parse key=value pairs
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        local line="${raw%%#*}"                 # strip inline comments
+        [[ -z "${line//[[:space:]]/}" ]] && continue  # skip blank lines
+        [[ "$line" != *=* ]] && continue
+        local key="${line%%=*}"
+        local value="${line#*=}"
+        key="${key//[[:space:]]/}"
+        value="${value//[[:space:]]/}"
+        [[ -z "$key" ]] && continue
+        case "$key" in
+            local-auth)
+                case "${value,,}" in
+                    true|1|yes)  SPRAY_LOCAL_AUTH=1 ;;
+                    false|0|no)  SPRAY_LOCAL_AUTH=0 ;;
+                esac ;;
+        esac
+    done < "$conf"
+}
+
 usage() {
     echo -e "${BOLD}Usage:${RESET}"
     echo "  $TOOL_NAME [global options] <command> [command options]"
@@ -56,6 +98,15 @@ usage() {
     # ── Global options ────────────────────────────────────────────────────────
     echo -e "${BOLD}Global options:${RESET}"
     echo "  -d <path>              Workspace path (overrides \$GIGASPRAY_DIR)"
+    echo "  -v                     Verbose — show per-item detail during bulk imports."
+    echo "                         Default is quiet: only summary counts are printed."
+    echo
+    echo "  --local-auth           Also spray with --local-auth (test local accounts)."
+    echo "                         Overrides the config file setting for this run."
+    echo "  --no-local-auth        Disable local-auth spray for this run."
+    echo "                         Config: ~/.config/gigaspray/gigaspray.conf"
+    echo "                           local-auth=True   (default)"
+    echo "                           local-auth=False"
     echo
     echo -e "${BOLD}Spray output options${RESET} (apply to all spray commands):"
     echo "  -q                     Quiet — show only [+] hits on terminal."
@@ -65,12 +116,23 @@ usage() {
     echo
     echo -e "${BOLD}Spray target option${RESET} (applies to all spray commands):"
     echo "  --spray-hosts <value>  Override the default spray target (hosts_ip.txt)."
+    echo "  -h <value>             Shorthand for --spray-hosts (standalone spray only)."
     echo "                         <value> is one of:"
     echo "                           • a single IP       e.g. 10.10.10.5"
     echo "                           • a single domain   e.g. corp.local"
     echo "                           • a single FQDN     e.g. dc01.corp.local"
     echo "                           • a file of targets (one entry per line)"
     echo "                         If omitted, hosts_ip.txt in the workspace is used."
+    echo
+    echo -e "${BOLD}Ephemeral credential options${RESET} (standalone spray only — NOT saved to workspace):"
+    echo "  -u <user>              Use this username for the spray without saving it."
+    echo "  -p <pass>              Use this password for the spray without saving it."
+    echo "  -H <hash>              Use this hash for the spray without saving it."
+    echo "                         Unspecified sides fall back to workspace files:"
+    echo "                           -u only  → all_pass.txt + all_hashes.txt"
+    echo "                           -p only  → all_user.txt"
+    echo "                           -H only  → all_user.txt"
+    echo "                           -h only  → all_user.txt × all_pass.txt + all_hashes.txt"
     echo
     # ── Commands ──────────────────────────────────────────────────────────────
     echo -e "${BOLD}Commands:${RESET}"
@@ -91,14 +153,21 @@ usage() {
     echo "                         Passwords containing colons are handled correctly."
     echo
     echo -e "${BOLD}--add host options:${RESET}"
-    echo "  -h <value>             Add a host by IP, domain name, or FQDN."
-    echo "                         Type is auto-detected:"
+    echo "  -h <value>             Add a host by IP, domain name, FQDN, or file."
+    echo "                         Single-value type is auto-detected:"
     echo "                           • IP    → hosts_ip.txt"
     echo "                           • FQDN  → hosts_fqdn.txt  (2+ dots)"
     echo "                           • other → hosts_dn.txt"
     echo "                         When an IP is given, nxc smb probes it to resolve"
     echo "                         hostname and domain, then populates all host files."
+    echo "                         When <value> is a FILE, bulk import is performed:"
+    echo "                           • /etc/hosts format → auto-detected, IPs + hostnames parsed"
+    echo "                           • plain list        → one IP/domain/FQDN per line;"
+    echo "                                                 domains are DNS-resolved to IPs"
     echo "                         hosts.txt is regenerated via nxc after every add."
+    echo "  --dns-server <ip>      DNS server to use when resolving domains during"
+    echo "                         plain-list bulk import. Defaults to the default"
+    echo "                         gateway (ip route show default), then system default."
     echo
     # ── Spray protocol flags ──────────────────────────────────────────────────
     echo -e "${BOLD}Spray protocol flags${RESET} (usable with --add or standalone):"
@@ -137,6 +206,12 @@ usage() {
     echo    "  $TOOL_NAME --add -h dc01.corp.local  # FQDN"
     echo    "  $TOOL_NAME --add -h corp.local       # domain name"
     echo
+    echo    "  # Bulk host import from file"
+    echo    "  $TOOL_NAME --add -h ips.txt                            # plain IP list"
+    echo    "  $TOOL_NAME --add -h domains.txt                        # plain domain list (DNS via default gateway)"
+    echo    "  $TOOL_NAME --add -h domains.txt --dns-server 10.10.10.1  # custom DNS server"
+    echo    "  $TOOL_NAME --add -h /etc/hosts                         # /etc/hosts format auto-detected"
+    echo
     echo    "  # Add creds then spray immediately"
     echo    "  $TOOL_NAME --add -u john -p 'P@\$\$w0rd' --spray-smb"
     echo    "  $TOOL_NAME --add -u john --spray-smb --spray-winrm  # new user, all passes"
@@ -156,6 +231,13 @@ usage() {
     echo    "  $TOOL_NAME --spray-smb --spray-hosts dc01.corp.local"
     echo    "  $TOOL_NAME --spray-smb --spray-hosts targets.txt"
     echo    "  $TOOL_NAME --add -u john -p pass --spray-smb --spray-hosts 10.10.10.5"
+    echo
+    echo    "  # Ephemeral spray (no workspace files modified)"
+    echo    "  $TOOL_NAME -h 10.10.10.5 --spray-rdp            # one host, all creds"
+    echo    "  $TOOL_NAME -h 10.10.10.5 -u john --spray-rdp   # one host+user, all passes/hashes"
+    echo    "  $TOOL_NAME -u john --spray-smb                  # one user, all passes/hashes"
+    echo    "  $TOOL_NAME -p 'P@\$\$w0rd' --spray-all          # one pass, all users"
+    echo    "  $TOOL_NAME -H aad3b435... --spray-smb           # one hash, all users"
 }
 
 # ─── Detect whether a string is an IPv4, FQDN, domain name, or short hostname ─
@@ -226,10 +308,12 @@ add_host() {
     case "$type" in
         ip)
             if add_unique "${GS_DIR}/hosts_ip.txt" "$val"; then
-                echo -e "    ${GREEN}+${RESET} IP         → hosts_ip.txt"
+                [[ "$VERBOSE" -eq 1 ]] && \
+                    echo -e "    ${GREEN}+${RESET} IP         → hosts_ip.txt  (${val})"
                 log_entry "ADD host ip='${val}'"
             else
-                echo -e "    ${YELLOW}~${RESET} IP         already in hosts_ip.txt (skipped)"
+                [[ "$VERBOSE" -eq 1 ]] && \
+                    echo -e "    ${YELLOW}~${RESET} IP         already in hosts_ip.txt (${val}) — skipped"
             fi
 
             # Try to resolve hostname and domain via nxc
@@ -240,28 +324,35 @@ add_host() {
 
             if [[ -n "$r_name" ]]; then
                 if add_unique "${GS_DIR}/hosts_dn.txt" "$r_name"; then
-                    echo -e "    ${GREEN}+${RESET} hostname   → hosts_dn.txt  (${r_name})"
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${GREEN}+${RESET} hostname   → hosts_dn.txt  (${r_name})"
                 else
-                    echo -e "    ${YELLOW}~${RESET} hostname   already in hosts_dn.txt (${r_name})"
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${YELLOW}~${RESET} hostname   already in hosts_dn.txt (${r_name})"
                 fi
             fi
 
             if [[ -n "$r_domain" ]]; then
                 if add_unique "${GS_DIR}/hosts_dn.txt" "$r_domain"; then
-                    echo -e "    ${GREEN}+${RESET} domain     → hosts_dn.txt  (${r_domain})"
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${GREEN}+${RESET} domain     → hosts_dn.txt  (${r_domain})"
                 else
-                    echo -e "    ${YELLOW}~${RESET} domain     already in hosts_dn.txt (${r_domain})"
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${YELLOW}~${RESET} domain     already in hosts_dn.txt (${r_domain})"
                 fi
             fi
 
             if [[ -n "$r_name" && -n "$r_domain" ]]; then
                 local fqdn="${r_name}.${r_domain}"
                 if add_unique "${GS_DIR}/hosts_fqdn.txt" "$fqdn"; then
-                    echo -e "    ${GREEN}+${RESET} FQDN       → hosts_fqdn.txt (${fqdn})"
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${GREEN}+${RESET} FQDN       → hosts_fqdn.txt (${fqdn})"
                 else
-                    echo -e "    ${YELLOW}~${RESET} FQDN       already in hosts_fqdn.txt (${fqdn})"
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${YELLOW}~${RESET} FQDN       already in hosts_fqdn.txt (${fqdn})"
                 fi
                 log_entry "ADD host ip='${val}' name='${r_name}' domain='${r_domain}' fqdn='${fqdn}'"
+                success "Resolved: ${r_name}.${r_domain} (${val})"
             elif [[ -z "$r_name" && -z "$r_domain" ]]; then
                 warn "Could not resolve hostname/domain for ${val} via nxc"
                 warn "Add domain name manually: $TOOL_NAME --add -h <domain_or_fqdn>"
@@ -270,23 +361,276 @@ add_host() {
 
         fqdn)
             if add_unique "${GS_DIR}/hosts_fqdn.txt" "$val"; then
-                echo -e "    ${GREEN}+${RESET} FQDN       → hosts_fqdn.txt"
+                [[ "$VERBOSE" -eq 1 ]] && \
+                    echo -e "    ${GREEN}+${RESET} FQDN       → hosts_fqdn.txt  (${val})"
                 log_entry "ADD host fqdn='${val}'"
             else
-                echo -e "    ${YELLOW}~${RESET} FQDN       already in hosts_fqdn.txt (skipped)"
+                [[ "$VERBOSE" -eq 1 ]] && \
+                    echo -e "    ${YELLOW}~${RESET} FQDN       already in hosts_fqdn.txt (${val}) — skipped"
             fi
             ;;
 
         domain|hostname)
             if add_unique "${GS_DIR}/hosts_dn.txt" "$val"; then
-                echo -e "    ${GREEN}+${RESET} domain/hn  → hosts_dn.txt"
+                [[ "$VERBOSE" -eq 1 ]] && \
+                    echo -e "    ${GREEN}+${RESET} domain/hn  → hosts_dn.txt  (${val})"
                 log_entry "ADD host domain='${val}'"
             else
-                echo -e "    ${YELLOW}~${RESET} domain/hn  already in hosts_dn.txt (skipped)"
+                [[ "$VERBOSE" -eq 1 ]] && \
+                    echo -e "    ${YELLOW}~${RESET} domain/hn  already in hosts_dn.txt (${val}) — skipped"
             fi
             ;;
     esac
 
+    echo
+    regenerate_hosts_file
+}
+
+# ─── Detect whether a file is in /etc/hosts format ───────────────────────────
+# Returns 0 if the file looks like /etc/hosts (IP<TAB/space>hostname on each
+# non-blank, non-comment line), 1 if it looks like a plain list of IPs/domains.
+is_hosts_file_format() {
+    local file="$1"
+    local has_hostname_line=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip blank lines and comments
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        # If the line has whitespace after the first token, it matches hosts format
+        if [[ "$line" =~ ^[^[:space:]]+[[:space:]]+[^[:space:]] ]]; then
+            has_hostname_line=1
+            break
+        fi
+    done < "$file"
+    [[ "$has_hostname_line" -eq 1 ]]
+}
+
+# ─── Resolve a hostname to an IP via dig / host / nslookup ───────────────────
+# Args: hostname [dns_server]
+# Prints the first A-record IP, or empty string on failure.
+resolve_dns() {
+    local hostname="$1"
+    local dns_server="${2:-}"
+    local ip=""
+
+    if command -v dig &>/dev/null; then
+        if [[ -n "$dns_server" ]]; then
+            ip="$(dig +short "@${dns_server}" "$hostname" A 2>/dev/null | grep -Eo '^[0-9.]+$' | head -1)" || true
+        else
+            ip="$(dig +short "$hostname" A 2>/dev/null | grep -Eo '^[0-9.]+$' | head -1)" || true
+        fi
+    fi
+
+    if [[ -z "$ip" ]] && command -v host &>/dev/null; then
+        if [[ -n "$dns_server" ]]; then
+            ip="$(host "$hostname" "$dns_server" 2>/dev/null \
+                | grep -oP '(?<=has address )[0-9.]+' | head -1)" || true
+        else
+            ip="$(host "$hostname" 2>/dev/null \
+                | grep -oP '(?<=has address )[0-9.]+' | head -1)" || true
+        fi
+    fi
+
+    if [[ -z "$ip" ]] && command -v nslookup &>/dev/null; then
+        if [[ -n "$dns_server" ]]; then
+            ip="$(nslookup "$hostname" "$dns_server" 2>/dev/null \
+                | awk '/^Address:/ && !/^Address: '"$dns_server"'/ {print $2; exit}')" || true
+        else
+            ip="$(nslookup "$hostname" 2>/dev/null \
+                | awk 'found && /^Address:/ {print $2; exit} /^Name:/ {found=1}')" || true
+        fi
+    fi
+
+    echo "$ip"
+}
+
+# ─── Import an /etc/hosts-format file into the workspace ─────────────────────
+# Parses IP<whitespace>hostname lines. Adds IP to hosts_ip.txt, classifies each
+# hostname into hosts_fqdn.txt or hosts_dn.txt, and writes the line verbatim to
+# hosts.txt. Calls regenerate_hosts_file() once at end.
+import_hosts_file() {
+    local file="$1"
+    local added=0 skipped=0
+
+    info "Importing /etc/hosts-format file: ${BOLD}${file}${RESET}"
+    [[ "$VERBOSE" -eq 1 ]] && echo
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip blank lines and comments
+        [[ -z "$line" || "$line" == \#* ]] && continue
+
+        # Extract IP (first field) and all hostnames (remaining fields)
+        local ip
+        ip="$(echo "$line" | awk '{print $1}')"
+        local -a hostnames
+        mapfile -t hostnames < <(echo "$line" | awk '{for(i=2;i<=NF;i++) print $i}')
+
+        if [[ -z "$ip" || ${#hostnames[@]} -eq 0 ]]; then
+            continue
+        fi
+
+        local line_new=0
+
+        # Add IP
+        if add_unique "${GS_DIR}/hosts_ip.txt" "$ip"; then
+            line_new=1
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${GREEN}+${RESET} IP         → hosts_ip.txt  (${ip})"
+        else
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${YELLOW}~${RESET} IP         already in hosts_ip.txt (${ip}) — skipped"
+        fi
+
+        # Classify and add each hostname
+        for hn in "${hostnames[@]}"; do
+            local htype
+            htype="$(detect_host_type "$hn")"
+            case "$htype" in
+                fqdn)
+                    if add_unique "${GS_DIR}/hosts_fqdn.txt" "$hn"; then
+                        line_new=1
+                        [[ "$VERBOSE" -eq 1 ]] && \
+                            echo -e "    ${GREEN}+${RESET} FQDN       → hosts_fqdn.txt (${hn})"
+                    else
+                        [[ "$VERBOSE" -eq 1 ]] && \
+                            echo -e "    ${YELLOW}~${RESET} FQDN       already in hosts_fqdn.txt (${hn}) — skipped"
+                    fi
+                    ;;
+                domain|hostname)
+                    if add_unique "${GS_DIR}/hosts_dn.txt" "$hn"; then
+                        line_new=1
+                        [[ "$VERBOSE" -eq 1 ]] && \
+                            echo -e "    ${GREEN}+${RESET} domain/hn  → hosts_dn.txt  (${hn})"
+                    else
+                        [[ "$VERBOSE" -eq 1 ]] && \
+                            echo -e "    ${YELLOW}~${RESET} domain/hn  already in hosts_dn.txt (${hn}) — skipped"
+                    fi
+                    ;;
+            esac
+        done
+
+        # Write the line verbatim to hosts.txt
+        if ! grep -qxF "$line" "${GS_DIR}/hosts.txt" 2>/dev/null; then
+            echo "$line" >> "${GS_DIR}/hosts.txt"
+        fi
+
+        log_entry "ADD host (hosts-file) ip='${ip}' hostnames='${hostnames[*]}'"
+        if [[ "$line_new" -eq 1 ]]; then
+            added=$((added + 1))
+        else
+            skipped=$((skipped + 1))
+        fi
+    done < "$file"
+
+    echo
+    success "Imported $((added + skipped)) host entry(ies) from $(basename "$file"): ${added} new, ${skipped} skipped."
+    echo
+    regenerate_hosts_file
+}
+
+# ─── Import a plain list of IPs / domains / FQDNs into the workspace ─────────
+# One entry per line. IPs go directly to hosts_ip.txt. Domains/FQDNs are also
+# DNS-resolved to get IPs. DNS server priority: --dns-server > default gateway
+# > system default. Calls regenerate_hosts_file() once at end.
+import_hosts_plain() {
+    local file="$1"
+    local dns_server="${2:-}"
+    local count=0
+
+    # Auto-detect default gateway as fallback DNS server
+    local effective_dns="$dns_server"
+    if [[ -z "$effective_dns" ]]; then
+        effective_dns="$(ip route show default 2>/dev/null \
+            | awk '/^default/ {print $3; exit}')" || true
+    fi
+
+    info "Importing plain host list: ${BOLD}${file}${RESET}"
+    [[ -n "$effective_dns" ]] && info "DNS server: ${effective_dns}"
+    [[ "$VERBOSE" -eq 1 ]] && echo
+
+    local added=0 skipped=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+
+        local entry_type
+        entry_type="$(detect_host_type "$line")"
+        local line_new=0
+
+        case "$entry_type" in
+            ip)
+                if add_unique "${GS_DIR}/hosts_ip.txt" "$line"; then
+                    line_new=1
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${GREEN}+${RESET} IP         → hosts_ip.txt  (${line})"
+                else
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${YELLOW}~${RESET} IP         already in hosts_ip.txt (${line}) — skipped"
+                fi
+                log_entry "ADD host (plain-list) ip='${line}'"
+                ;;
+            fqdn)
+                if add_unique "${GS_DIR}/hosts_fqdn.txt" "$line"; then
+                    line_new=1
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${GREEN}+${RESET} FQDN       → hosts_fqdn.txt (${line})"
+                else
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${YELLOW}~${RESET} FQDN       already in hosts_fqdn.txt (${line}) — skipped"
+                fi
+                # DNS-resolve to also populate hosts_ip.txt
+                local resolved_ip
+                resolved_ip="$(resolve_dns "$line" "$effective_dns")" || true
+                if [[ -n "$resolved_ip" ]]; then
+                    if add_unique "${GS_DIR}/hosts_ip.txt" "$resolved_ip"; then
+                        line_new=1
+                        [[ "$VERBOSE" -eq 1 ]] && \
+                            echo -e "    ${GREEN}+${RESET} resolved   → hosts_ip.txt  (${resolved_ip})"
+                    else
+                        [[ "$VERBOSE" -eq 1 ]] && \
+                            echo -e "    ${YELLOW}~${RESET} resolved   already in hosts_ip.txt (${resolved_ip}) — skipped"
+                    fi
+                else
+                    warn "Could not resolve ${line} to an IP — add manually if needed"
+                fi
+                log_entry "ADD host (plain-list) fqdn='${line}' resolved='${resolved_ip:-}'"
+                ;;
+            domain|hostname)
+                if add_unique "${GS_DIR}/hosts_dn.txt" "$line"; then
+                    line_new=1
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${GREEN}+${RESET} domain/hn  → hosts_dn.txt  (${line})"
+                else
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${YELLOW}~${RESET} domain/hn  already in hosts_dn.txt (${line}) — skipped"
+                fi
+                # DNS-resolve to also populate hosts_ip.txt
+                local resolved_ip
+                resolved_ip="$(resolve_dns "$line" "$effective_dns")" || true
+                if [[ -n "$resolved_ip" ]]; then
+                    if add_unique "${GS_DIR}/hosts_ip.txt" "$resolved_ip"; then
+                        line_new=1
+                        [[ "$VERBOSE" -eq 1 ]] && \
+                            echo -e "    ${GREEN}+${RESET} resolved   → hosts_ip.txt  (${resolved_ip})"
+                    else
+                        [[ "$VERBOSE" -eq 1 ]] && \
+                            echo -e "    ${YELLOW}~${RESET} resolved   already in hosts_ip.txt (${resolved_ip}) — skipped"
+                    fi
+                else
+                    warn "Could not resolve ${line} to an IP — add manually if needed"
+                fi
+                log_entry "ADD host (plain-list) domain='${line}' resolved='${resolved_ip:-}'"
+                ;;
+        esac
+
+        if [[ "$line_new" -eq 1 ]]; then
+            added=$((added + 1))
+        else
+            skipped=$((skipped + 1))
+        fi
+    done < "$file"
+
+    echo
+    success "Imported $((added + skipped)) host entry(ies) from $(basename "$file"): ${added} new, ${skipped} skipped."
     echo
     regenerate_hosts_file
 }
@@ -372,30 +716,41 @@ resolve_gs_dir() {
 write_cred() {
     local user="${1:-}" pass="${2:-}" hash="${3:-}" desc="${4:-}"
 
+    _WRITE_CRED_ADDED=0
+
     # ── all_user.txt ──────────────────────────────────────────────────────────
     if [[ -n "$user" ]]; then
         if add_unique "${GS_DIR}/all_user.txt" "$user"; then
-            echo -e "    ${GREEN}+${RESET} user      → all_user.txt"
+            _WRITE_CRED_ADDED=1
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${GREEN}+${RESET} user      → all_user.txt  (${user})"
         else
-            echo -e "    ${YELLOW}~${RESET} user      already in all_user.txt (skipped)"
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${YELLOW}~${RESET} user      already in all_user.txt (${user}) — skipped"
         fi
     fi
 
     # ── all_pass.txt ──────────────────────────────────────────────────────────
     if [[ -n "$pass" ]]; then
         if add_unique "${GS_DIR}/all_pass.txt" "$pass"; then
-            echo -e "    ${GREEN}+${RESET} password  → all_pass.txt"
+            _WRITE_CRED_ADDED=1
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${GREEN}+${RESET} password  → all_pass.txt  (${pass})"
         else
-            echo -e "    ${YELLOW}~${RESET} password  already in all_pass.txt (skipped)"
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${YELLOW}~${RESET} password  already in all_pass.txt (${pass}) — skipped"
         fi
     fi
 
     # ── all_hashes.txt ────────────────────────────────────────────────────────
     if [[ -n "$hash" ]]; then
         if add_unique "${GS_DIR}/all_hashes.txt" "$hash"; then
-            echo -e "    ${GREEN}+${RESET} hash      → all_hashes.txt"
+            _WRITE_CRED_ADDED=1
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${GREEN}+${RESET} hash      → all_hashes.txt  (${hash})"
         else
-            echo -e "    ${YELLOW}~${RESET} hash      already in all_hashes.txt (skipped)"
+            [[ "$VERBOSE" -eq 1 ]] && \
+                echo -e "    ${YELLOW}~${RESET} hash      already in all_hashes.txt (${hash}) — skipped"
         fi
     fi
 
@@ -404,7 +759,8 @@ write_cred() {
         echo "$user" >> "${GS_DIR}/user_paired.txt"
         echo "$pass" >> "${GS_DIR}/pass_paired.txt"
         echo "${user}:${pass}${desc:+:${desc}}" >> "${GS_DIR}/creds.txt"
-        echo -e "    ${GREEN}+${RESET} pair      → user_paired.txt / pass_paired.txt / creds.txt"
+        [[ "$VERBOSE" -eq 1 ]] && \
+            echo -e "    ${GREEN}+${RESET} pair      → user_paired.txt / pass_paired.txt / creds.txt"
         log_entry "ADD user:pass user='${user}' desc='${desc}'"
     fi
 
@@ -413,7 +769,8 @@ write_cred() {
         echo "$user" >> "${GS_DIR}/hash_user_paired.txt"
         echo "$hash" >> "${GS_DIR}/hashes_paired.txt"
         echo "${user}:${hash}${desc:+:${desc}}" >> "${GS_DIR}/creds.txt"
-        echo -e "    ${GREEN}+${RESET} hash pair → hash_user_paired.txt / hashes_paired.txt / creds.txt"
+        [[ "$VERBOSE" -eq 1 ]] && \
+            echo -e "    ${GREEN}+${RESET} hash pair → hash_user_paired.txt / hashes_paired.txt / creds.txt"
         log_entry "ADD user:hash user='${user}' desc='${desc}'"
     fi
 
@@ -478,8 +835,20 @@ spray_exec() {
     local tmpfile
     tmpfile="$(mktemp)"
 
+    # Build display string: wrap the value after -p in single quotes
+    local display_cmd=() i=0
+    while [[ $i -lt ${#cmd[@]} ]]; do
+        if [[ "${cmd[$i]}" == "-p" && $((i+1)) -lt ${#cmd[@]} ]]; then
+            display_cmd+=("-p" "'${cmd[$((i+1))]}'")
+            i=$((i+2))
+        else
+            display_cmd+=("${cmd[$i]}")
+            i=$((i+1))
+        fi
+    done
+
     # Always print the command being run
-    echo -e "  ${CYAN}\$${RESET} ${cmd[*]}"
+    echo -e "  ${CYAN}\$${RESET} ${display_cmd[*]}"
     echo
 
     # Resolve named outfile (empty if -o not set)
@@ -587,6 +956,26 @@ run_spray() {
         spray_exec "${protocol^^} hash-spray" "$protocol" "${cmd[@]}"
         log_entry "SPRAY ${protocol^^} user='${user:-<file>}' hash='${hash:-<file>}'"
     fi
+
+    # ── local-auth spray (if enabled) ─────────────────────────────────────────
+    if [[ "$SPRAY_LOCAL_AUTH" -eq 1 ]]; then
+        echo
+        info "${BOLD}${protocol^^}${RESET} local-auth spray → ${targets}"
+
+        if [[ ${#p_arg[@]} -gt 0 ]]; then
+            local -a cmd=(nxc "$protocol" "$targets" "${u_arg[@]}" "${p_arg[@]}" \
+                          --local-auth --continue-on-success)
+            spray_exec "${protocol^^} local-auth pass-spray" "$protocol" "${cmd[@]}"
+            log_entry "SPRAY ${protocol^^} local-auth user='${user:-<file>}' pass='${pass:-<file>}'"
+        fi
+
+        if [[ ${#h_arg[@]} -gt 0 ]]; then
+            local -a cmd=(nxc "$protocol" "$targets" "${u_arg[@]}" "${h_arg[@]}" \
+                          --local-auth --continue-on-success)
+            spray_exec "${protocol^^} local-auth hash-spray" "$protocol" "${cmd[@]}"
+            log_entry "SPRAY ${protocol^^} local-auth user='${user:-<file>}' hash='${hash:-<file>}'"
+        fi
+    fi
 }
 
 # ─── Run sprays across one or more protocols ──────────────────────────────────
@@ -603,10 +992,13 @@ run_sprays() {
     echo
     info "Starting spray (${#protocols[@]} protocol(s): ${protocols[*]})"
     local target_display="${SPRAY_HOSTS:-${GS_DIR}/hosts_ip.txt}"
-    echo "  targets : ${target_display}"
-    [[ -n "$user" ]] && echo "  user    : $user" || echo "  user    : all_user.txt"
-    [[ -n "$pass" ]] && echo "  pass    : $pass" || echo "  pass    : all_pass.txt"
-    [[ -n "$hash" ]] && echo "  hash    : $hash" || echo "  hash    : all_hashes.txt"
+    echo "  targets    : ${target_display}"
+    [[ -n "$user" ]] && echo "  user       : $user" || echo "  user       : all_user.txt"
+    [[ -n "$pass" ]] && echo "  pass       : $pass" || echo "  pass       : all_pass.txt"
+    [[ -n "$hash" ]] && echo "  hash       : $hash" || echo "  hash       : all_hashes.txt"
+    [[ "$SPRAY_LOCAL_AUTH" -eq 1 ]] \
+        && echo "  local-auth : enabled  (--no-local-auth to disable)" \
+        || echo "  local-auth : disabled (--local-auth to enable)"
 
     for proto in "${protocols[@]}"; do
         run_spray "$proto" "$user" "$pass" "$hash"
@@ -664,6 +1056,11 @@ cmd_add() {
                            SPRAY_OUTNAME="$2"; shift 2 ;;
             --spray-hosts) [[ $# -lt 2 ]] && die "--spray-hosts requires a value or file path"
                            SPRAY_HOSTS="$2"; shift 2 ;;
+            --dns-server)    [[ $# -lt 2 ]] && die "--dns-server requires an IP address"
+                             DNS_SERVER="$2"; shift 2 ;;
+            --local-auth)    SPRAY_LOCAL_AUTH=1; shift ;;
+            --no-local-auth) SPRAY_LOCAL_AUTH=0; shift ;;
+            -v)              VERBOSE=1; shift ;;
             *)         die "Unknown option for --add: $1" ;;
         esac
     done
@@ -682,7 +1079,15 @@ cmd_add() {
 
     # ── Host add ──────────────────────────────────────────────────────────────
     if [[ -n "$host_val" ]]; then
-        add_host "$host_val"
+        if [[ -f "$host_val" ]]; then
+            if is_hosts_file_format "$host_val"; then
+                import_hosts_file "$host_val"
+            else
+                import_hosts_plain "$host_val" "$DNS_SERVER"
+            fi
+        else
+            add_host "$host_val"
+        fi
     fi
 
     # ── Nothing provided at all ────────────────────────────────────────────────
@@ -714,18 +1119,23 @@ cmd_add() {
         [[ ! -f "$cred_file" ]] && die "Cred file not found: $cred_file"
         echo
         info "Importing cred pairs from: ${BOLD}${cred_file}${RESET}"
-        echo
-        local count=0
+        [[ "$VERBOSE" -eq 1 ]] && echo
+        local added=0 skipped=0
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ -z "$line" || "$line" == \#* ]] && continue
             local u="${line%%:*}"
             local p=""
             [[ "$line" == *:* ]] && p="${line#*:}"
+            _WRITE_CRED_ADDED=0
             write_cred "$u" "$p" "" "$desc"
-            count=$((count + 1))
+            if [[ "$_WRITE_CRED_ADDED" -eq 1 ]]; then
+                added=$((added + 1))
+            else
+                skipped=$((skipped + 1))
+            fi
         done < "$cred_file"
         echo
-        success "Imported ${count} credential pair(s) from $(basename "$cred_file")."
+        success "Imported $((added + skipped)) credential pair(s) from $(basename "$cred_file"): ${added} new, ${skipped} skipped."
     fi
 
     # ── -U / -P: import from separate user and/or password files ──────────────
@@ -749,44 +1159,62 @@ cmd_add() {
                 warn "File lengths differ (${#users[@]} users, ${#passes[@]} passes)." \
                      "Pairing up to line ${min_len}."
             fi
-            local i
+            [[ "$VERBOSE" -eq 1 ]] && echo
+            local i paired_added=0 paired_skipped=0
             for (( i=0; i<min_len; i++ )); do
+                _WRITE_CRED_ADDED=0
                 write_cred "${users[$i]}" "${passes[$i]}" "" "$desc"
+                if [[ "$_WRITE_CRED_ADDED" -eq 1 ]]; then
+                    paired_added=$((paired_added + 1))
+                else
+                    paired_skipped=$((paired_skipped + 1))
+                fi
             done
             echo
-            success "Imported ${min_len} paired credential(s)."
+            success "Imported ${min_len} paired credential(s): ${paired_added} new, ${paired_skipped} skipped."
 
         elif [[ -n "$user_file" ]]; then
             # Usernames only
             echo
             info "Importing usernames from: ${BOLD}${user_file}${RESET}"
-            echo
-            local count=0
+            [[ "$VERBOSE" -eq 1 ]] && echo
+            local added=0 skipped=0
             while IFS= read -r line || [[ -n "$line" ]]; do
                 [[ -z "$line" || "$line" == \#* ]] && continue
-                write_cred "$line" "" "" ""
-                count=$((count + 1))
+                if add_unique "${GS_DIR}/all_user.txt" "$line"; then
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${GREEN}+${RESET} user      → all_user.txt  (${line})"
+                    log_entry "ADD user user='${line}'"
+                    added=$((added + 1))
+                else
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${YELLOW}~${RESET} user      already in all_user.txt (${line}) — skipped"
+                    skipped=$((skipped + 1))
+                fi
             done < "$user_file"
             echo
-            success "Imported ${count} username(s)."
+            success "Imported $((added + skipped)) username(s): ${added} new, ${skipped} skipped."
 
         else
             # Passwords only — no pairing, just bulk-add to all_pass.txt
             echo
             info "Importing passwords from: ${BOLD}${pass_file}${RESET}"
-            echo
-            local count=0
+            [[ "$VERBOSE" -eq 1 ]] && echo
+            local added=0 skipped=0
             while IFS= read -r line || [[ -n "$line" ]]; do
                 [[ -z "$line" || "$line" == \#* ]] && continue
                 if add_unique "${GS_DIR}/all_pass.txt" "$line"; then
-                    echo -e "    ${GREEN}+${RESET} password → all_pass.txt"
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${GREEN}+${RESET} password  → all_pass.txt  (${line})"
+                    added=$((added + 1))
                 else
-                    echo -e "    ${YELLOW}~${RESET} password already in all_pass.txt (skipped)"
+                    [[ "$VERBOSE" -eq 1 ]] && \
+                        echo -e "    ${YELLOW}~${RESET} password  already in all_pass.txt (${line}) — skipped"
+                    skipped=$((skipped + 1))
                 fi
-                count=$((count + 1))
             done < "$pass_file"
             echo
-            success "Imported ${count} password(s)."
+            success "Imported $((added + skipped)) password(s): ${added} new, ${skipped} skipped."
         fi
     fi
 
@@ -864,10 +1292,16 @@ cmd_init() {
     echo -e "  ${BOLD}Logs:${RESET}"
     echo    "    logs/gigaspray.log"
     echo
+    echo -e "  ${BOLD}Config:${RESET}"
+    echo    "    ${HOME}/.config/gigaspray/gigaspray.conf"
+    echo    "    (created automatically on first run with defaults)"
+    echo
 }
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 main() {
+    load_config   # load ~/.config/gigaspray/gigaspray.conf before flag parsing
+
     [[ $# -eq 0 ]] && { usage; exit 1; }
 
     local flag_dir=""
@@ -879,12 +1313,30 @@ main() {
                 flag_dir="$2"; shift 2 ;;
             -q)
                 SPRAY_QUIET=1; shift ;;
+            -v)
+                VERBOSE=1; shift ;;
+            --local-auth)
+                SPRAY_LOCAL_AUTH=1; shift ;;
+            --no-local-auth)
+                SPRAY_LOCAL_AUTH=0; shift ;;
             -o)
                 [[ $# -lt 2 ]] && die "-o requires a name argument"
                 SPRAY_OUTNAME="$2"; shift 2 ;;
             --spray-hosts)
                 [[ $# -lt 2 ]] && die "--spray-hosts requires a value or file path"
                 SPRAY_HOSTS="$2"; shift 2 ;;
+            -h)
+                [[ $# -lt 2 ]] && die "-h requires a host value"
+                SPRAY_HOSTS="$2"; shift 2 ;;
+            -u)
+                [[ $# -lt 2 ]] && die "-u requires a username"
+                SPRAY_EPHEMERAL_USER="$2"; shift 2 ;;
+            -p)
+                [[ $# -lt 2 ]] && die "-p requires a password"
+                SPRAY_EPHEMERAL_PASS="$2"; shift 2 ;;
+            -H)
+                [[ $# -lt 2 ]] && die "-H requires a hash"
+                SPRAY_EPHEMERAL_HASH="$2"; shift 2 ;;
             init)
                 cmd_init; exit $? ;;
             --add)
@@ -893,7 +1345,7 @@ main() {
             --spray-ldap|--spray-ftp|--spray-mssql|--spray-all)
                 proto="${1#--spray-}"
                 shift
-                # Consume any -q / -o / --spray-hosts that follow the spray command
+                # Consume any remaining options that follow the spray command
                 while [[ $# -gt 0 ]]; do
                     case "$1" in
                         -q)            SPRAY_QUIET=1; shift ;;
@@ -901,14 +1353,30 @@ main() {
                                        SPRAY_OUTNAME="$2"; shift 2 ;;
                         --spray-hosts) [[ $# -lt 2 ]] && die "--spray-hosts requires a value or file path"
                                        SPRAY_HOSTS="$2"; shift 2 ;;
-                        *)             break ;;
+                        -h)            [[ $# -lt 2 ]] && die "-h requires a host value"
+                                       SPRAY_HOSTS="$2"; shift 2 ;;
+                        -u)            [[ $# -lt 2 ]] && die "-u requires a username"
+                                       SPRAY_EPHEMERAL_USER="$2"; shift 2 ;;
+                        -p)            [[ $# -lt 2 ]] && die "-p requires a password"
+                                       SPRAY_EPHEMERAL_PASS="$2"; shift 2 ;;
+                        -H)              [[ $# -lt 2 ]] && die "-H requires a hash"
+                                         SPRAY_EPHEMERAL_HASH="$2"; shift 2 ;;
+                        --local-auth)    SPRAY_LOCAL_AUTH=1; shift ;;
+                        --no-local-auth) SPRAY_LOCAL_AUTH=0; shift ;;
+                        *)               break ;;
                     esac
                 done
                 require_gs_dir "$flag_dir"
+                if [[ -n "$SPRAY_EPHEMERAL_USER" || -n "$SPRAY_EPHEMERAL_PASS" \
+                   || -n "$SPRAY_EPHEMERAL_HASH" ]]; then
+                    warn "Ephemeral mode — credentials not saved to workspace."
+                fi
                 if [[ "$proto" == "all" ]]; then
-                    run_sprays "" "" "" "${SPRAY_PROTOCOLS[@]}"
+                    run_sprays "$SPRAY_EPHEMERAL_USER" "$SPRAY_EPHEMERAL_PASS" \
+                               "$SPRAY_EPHEMERAL_HASH" "${SPRAY_PROTOCOLS[@]}"
                 else
-                    run_sprays "" "" "" "$proto"
+                    run_sprays "$SPRAY_EPHEMERAL_USER" "$SPRAY_EPHEMERAL_PASS" \
+                               "$SPRAY_EPHEMERAL_HASH" "$proto"
                 fi
                 exit $? ;;
             --help)
