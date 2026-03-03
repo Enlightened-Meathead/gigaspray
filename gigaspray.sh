@@ -25,6 +25,7 @@ DNS_SERVER=""            # --dns-server: override DNS server for bulk host resol
 VERBOSE=0                # -v: show per-item detail during bulk imports
 SPRAY_LOCAL_AUTH=0       # 1=also spray with --local-auth; loaded from config, CLI overrides
 _WRITE_CRED_ADDED=0      # internal: set to 1 by write_cred() when anything new is added
+_CLEAN_REMOVED=0         # internal: duplicate count accumulated by cmd_clean helpers
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 info()    { echo -e "${CYAN}[*]${RESET} $*"; }
@@ -138,6 +139,13 @@ usage() {
     echo -e "${BOLD}Commands:${RESET}"
     echo "  init                   Create a new gigaspray workspace"
     echo "  --add                  Add credentials or hosts to the workspace"
+    echo "  --clean                Remove duplicates from all workspace files."
+    echo "                         Simple files (all_user.txt, all_pass.txt, etc.)"
+    echo "                         are deduplicated by exact line. Paired files"
+    echo "                         (user_paired/pass_paired, hash_user_paired/"
+    echo "                         hashes_paired) are deduplicated on the (user, cred)"
+    echo "                         pair — one user with multiple passwords and multiple"
+    echo "                         users sharing a password are both preserved."
     echo "  --spray-<proto>        Standalone spray for a specific protocol"
     echo "  --spray-all            Standalone spray across all protocols"
     echo
@@ -1289,6 +1297,124 @@ cmd_add() {
     fi
 }
 
+# ─── Dedup a single file in-place, preserving first-occurrence order ──────────
+# Increments _CLEAN_REMOVED by the number of lines removed.
+_dedup_file() {
+    local file="$1" label="$2"
+    [[ ! -f "$file" ]] && return
+
+    local before after removed tmp
+    before="$(wc -l < "$file")"
+    tmp="$(mktemp)"
+    awk '!seen[$0]++' "$file" > "$tmp"
+    after="$(wc -l < "$tmp")"
+    removed=$(( before - after ))
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+
+    if [[ "$removed" -gt 0 ]]; then
+        echo -e "  ${GREEN}✓${RESET} ${label}: ${removed} duplicate(s) removed"
+    else
+        echo -e "  ${CYAN}·${RESET} ${label}: clean"
+    fi
+    _CLEAN_REMOVED=$(( _CLEAN_REMOVED + removed ))
+}
+
+# ─── Dedup two parallel paired files, preserving pairs where one side differs ─
+# A "duplicate pair" is a row where BOTH file1[i] and file2[i] are identical to
+# a previously seen row.  Rows like (john, pass1) and (john, pass2) are kept
+# because they represent different credentials for the same user.
+# Increments _CLEAN_REMOVED by the number of duplicate pairs removed.
+_dedup_paired() {
+    local file1="$1" file2="$2" label="$3"
+    [[ ! -f "$file1" || ! -f "$file2" ]] && return
+
+    local tmp1 tmp2 before after removed
+    tmp1="$(mktemp)"
+    tmp2="$(mktemp)"
+    before=0
+    after=0
+    local sep=$'\x01'   # SOH — safe separator that won't appear in usernames/passwords
+    declare -A _seen_pairs
+
+    while IFS= read -r f1_line <&3 && IFS= read -r f2_line <&4; do
+        before=$(( before + 1 ))
+        local key="${f1_line}${sep}${f2_line}"
+        if [[ -z "${_seen_pairs[$key]+x}" ]]; then
+            _seen_pairs[$key]=1
+            echo "$f1_line" >> "$tmp1"
+            echo "$f2_line" >> "$tmp2"
+            after=$(( after + 1 ))
+        fi
+    done 3< "$file1" 4< "$file2"
+
+    removed=$(( before - after ))
+    cat "$tmp1" > "$file1"; rm -f "$tmp1"
+    cat "$tmp2" > "$file2"; rm -f "$tmp2"
+
+    if [[ "$removed" -gt 0 ]]; then
+        echo -e "  ${GREEN}✓${RESET} ${label}: ${removed} duplicate pair(s) removed"
+    else
+        echo -e "  ${CYAN}·${RESET} ${label}: clean"
+    fi
+    _CLEAN_REMOVED=$(( _CLEAN_REMOVED + removed ))
+}
+
+# ─── --clean command ───────────────────────────────────────────────────────────
+cmd_clean() {
+    local flag_dir="$1"
+    require_gs_dir "$flag_dir"
+
+    _CLEAN_REMOVED=0   # not local — shared with _dedup_file / _dedup_paired
+
+    echo
+    info "Cleaning workspace: ${BOLD}${GS_DIR}${RESET}"
+    echo
+
+    # ── Credential files (simple unique-line dedup) ───────────────────────────
+    echo -e "  ${BOLD}Credential lists:${RESET}"
+    _dedup_file "${GS_DIR}/all_user.txt"    "all_user.txt"
+    _dedup_file "${GS_DIR}/all_pass.txt"    "all_pass.txt"
+    _dedup_file "${GS_DIR}/all_hashes.txt"  "all_hashes.txt"
+    _dedup_file "${GS_DIR}/creds.txt"       "creds.txt"
+    _dedup_file "${GS_DIR}/valid_creds.txt" "valid_creds.txt"
+    echo
+
+    # ── Paired files (dedup on the (user, cred) pair; keeps one user + many
+    #    different passwords, and many users sharing the same password) ─────────
+    echo -e "  ${BOLD}Paired credential files:${RESET}"
+    echo -e "  ${CYAN}(same user with different passwords/hashes is preserved)${RESET}"
+    _dedup_paired "${GS_DIR}/user_paired.txt"      \
+                  "${GS_DIR}/pass_paired.txt"      \
+                  "user_paired / pass_paired"
+    _dedup_paired "${GS_DIR}/hash_user_paired.txt" \
+                  "${GS_DIR}/hashes_paired.txt"    \
+                  "hash_user_paired / hashes_paired"
+    echo
+
+    # ── Host files ────────────────────────────────────────────────────────────
+    local before_hosts="$_CLEAN_REMOVED"
+    echo -e "  ${BOLD}Host files:${RESET}"
+    _dedup_file "${GS_DIR}/hosts_ip.txt"   "hosts_ip.txt"
+    _dedup_file "${GS_DIR}/hosts_dn.txt"   "hosts_dn.txt"
+    _dedup_file "${GS_DIR}/hosts_fqdn.txt" "hosts_fqdn.txt"
+    _dedup_file "${GS_DIR}/hosts.txt"      "hosts.txt"
+
+    # If any host file changed, regenerate hosts.txt from the cleaned IPs
+    if [[ $(( _CLEAN_REMOVED - before_hosts )) -gt 0 ]]; then
+        echo
+        regenerate_hosts_file
+    fi
+
+    echo
+    if [[ "$_CLEAN_REMOVED" -gt 0 ]]; then
+        success "Clean complete: ${_CLEAN_REMOVED} duplicate(s) removed."
+    else
+        success "Clean complete: workspace is already clean."
+    fi
+    log_entry "CLEAN removed=${_CLEAN_REMOVED}"
+}
+
 # ─── init command ─────────────────────────────────────────────────────────────
 cmd_init() {
     banner
@@ -1404,6 +1530,8 @@ main() {
                 cmd_init; exit $? ;;
             --add)
                 shift; cmd_add "$flag_dir" "$@"; exit $? ;;
+            --clean)
+                cmd_clean "$flag_dir"; exit $? ;;
             --spray-smb|--spray-rdp|--spray-winrm|--spray-ssh|\
             --spray-ldap|--spray-ftp|--spray-mssql|--spray-all)
                 proto="${1#--spray-}"
